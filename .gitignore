@@ -1,0 +1,17 @@
+# Windows / OneDrive
+desktop.ini
+Thumbs.db
+ehthumbs.db
+*.lnk
+
+# macOS
+.DS_Store
+
+# Node (o projeto não tem build; isto é só pro http-server via npx)
+node_modules/
+npm-debug.log*
+
+# Editores
+.vscode/
+.idea/
+*.swp

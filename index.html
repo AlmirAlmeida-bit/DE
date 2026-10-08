@@ -1,0 +1,1177 @@
+<html lang="pt-BR"><head>
+<script id="aura-supabase-token-firewall">(function () {
+  if (window.__AURA_SUPABASE_FIREWALL__) return;
+  window.__AURA_SUPABASE_FIREWALL__ = true;
+
+  var SUPABASE_HOST = "hoirqrkdgbmvpwutwuwj.supabase.co";
+  var BLOCKED_KEY_PATTERNS = [
+    /^sb-[a-z0-9-]+-auth-token$/i,
+    /^supabase\.auth\.token$/i
+  ];
+
+  function isBlockedStorageKey(key) {
+    if (typeof key !== "string") return false;
+    for (var i = 0; i < BLOCKED_KEY_PATTERNS.length; i++) {
+      if (BLOCKED_KEY_PATTERNS[i].test(key)) return true;
+    }
+    return false;
+  }
+
+  function toAbsoluteUrl(input) {
+    try {
+      return new URL(input, window.location.href);
+    } catch {
+      return null;
+    }
+  }
+
+  function isSupabaseDestination(input) {
+    var parsed = toAbsoluteUrl(input);
+    if (!parsed) return false;
+    if (SUPABASE_HOST && parsed.host === SUPABASE_HOST) return true;
+    return parsed.host.endsWith(".supabase.co");
+  }
+
+  function pathLooksSensitive(input) {
+    var parsed = toAbsoluteUrl(input);
+    if (!parsed) return false;
+    return /^\/(auth|rest|functions)\/v1\//.test(parsed.pathname || "");
+  }
+
+  function headersContainAuth(headersLike) {
+    if (!headersLike) return false;
+
+    try {
+      if (typeof Headers !== "undefined" && headersLike instanceof Headers) {
+        return !!(headersLike.get("authorization") || headersLike.get("apikey"));
+      }
+    } catch {}
+
+    if (Array.isArray(headersLike)) {
+      for (var i = 0; i < headersLike.length; i++) {
+        var pair = headersLike[i] || [];
+        var name = String(pair[0] || "").toLowerCase();
+        if (name === "authorization" || name === "apikey") return true;
+      }
+      return false;
+    }
+
+    if (typeof headersLike === "object") {
+      var keys = Object.keys(headersLike);
+      for (var j = 0; j < keys.length; j++) {
+        var k = keys[j].toLowerCase();
+        if (k === "authorization" || k === "apikey") return true;
+      }
+    }
+    return false;
+  }
+
+  function requestLooksSensitive(input, init, extraHeaders) {
+    var url = "";
+    try {
+      if (typeof input === "string") {
+        url = input;
+      } else if (input && typeof input.url === "string") {
+        url = input.url;
+      }
+    } catch {}
+
+    var headers =
+      (init && init.headers) ||
+      (input && input.headers) ||
+      extraHeaders ||
+      null;
+    var hasAuthHeaders = headersContainAuth(headers);
+    if (hasAuthHeaders) return true;
+
+    if (!url) return false;
+    if (isSupabaseDestination(url) && pathLooksSensitive(url)) return true;
+    return false;
+  }
+
+  function patchStorage(storage, storageName) {
+    if (!storage) return;
+    var proto = Object.getPrototypeOf(storage);
+    if (!proto || proto.__auraSupabaseFirewallPatched) return;
+
+    var rawGetItem = proto.getItem;
+    var rawSetItem = proto.setItem;
+    var rawRemoveItem = proto.removeItem;
+    var rawKey = proto.key;
+    var rawLengthDescriptor = Object.getOwnPropertyDescriptor(proto, "length");
+    var rawLengthGet = rawLengthDescriptor && rawLengthDescriptor.get;
+
+    function getRawLength(instance) {
+      try {
+        if (rawLengthGet) return Number(rawLengthGet.call(instance) || 0);
+      } catch {}
+      try {
+        return Number(instance.length || 0);
+      } catch {}
+      return 0;
+    }
+
+    function getVisibleKeys(instance) {
+      var visible = [];
+      var total = getRawLength(instance);
+      for (var i = 0; i < total; i++) {
+        var currentKey = rawKey.call(instance, i);
+        if (currentKey && !isBlockedStorageKey(currentKey)) {
+          visible.push(currentKey);
+        }
+      }
+      return visible;
+    }
+
+    function maskBlockedKeyProperty(instance, keyName) {
+      if (!keyName || !isBlockedStorageKey(keyName)) return;
+      try {
+        Object.defineProperty(instance, keyName, {
+          configurable: true,
+          enumerable: false,
+          get: function () {
+            return null;
+          },
+          set: function () {
+            return true;
+          }
+        });
+      } catch {}
+    }
+
+    function syncBlockedKeyProperties(instance) {
+      var total = getRawLength(instance);
+      for (var i = 0; i < total; i++) {
+        var k = rawKey.call(instance, i);
+        if (k) maskBlockedKeyProperty(instance, k);
+      }
+    }
+
+    proto.getItem = function (key) {
+      syncBlockedKeyProperties(this);
+      if (isBlockedStorageKey(String(key))) return null;
+      return rawGetItem.call(this, key);
+    };
+
+    proto.setItem = function (key, value) {
+      if (isBlockedStorageKey(String(key))) return;
+      return rawSetItem.call(this, key, value);
+    };
+
+    proto.removeItem = function (key) {
+      if (isBlockedStorageKey(String(key))) return;
+      return rawRemoveItem.call(this, key);
+    };
+
+    proto.key = function (index) {
+      syncBlockedKeyProperties(this);
+      var visible = getVisibleKeys(this);
+      return visible[index] || null;
+    };
+
+    try {
+      Object.defineProperty(proto, "length", {
+        configurable: true,
+        enumerable: false,
+        get: function () {
+          syncBlockedKeyProperties(this);
+          return getVisibleKeys(this).length;
+        }
+      });
+    } catch {}
+
+    var proxyStorage = null;
+    try {
+      proxyStorage = new Proxy(storage, {
+        get: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return null;
+          if (prop === "length") return getVisibleKeys(target).length;
+          if (prop === "key") {
+            return function (index) {
+              var visible = getVisibleKeys(target);
+              return visible[index] || null;
+            };
+          }
+
+          var value = target[prop];
+          if (typeof value === "function") return value.bind(target);
+          return value;
+        },
+        set: function (target, prop, value) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return true;
+          target[prop] = value;
+          return true;
+        },
+        has: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return false;
+          return prop in target;
+        },
+        ownKeys: function (target) {
+          return getVisibleKeys(target);
+        },
+        getOwnPropertyDescriptor: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) {
+            return undefined;
+          }
+          if (prop === "length") {
+            return {
+              configurable: true,
+              enumerable: false,
+              value: getVisibleKeys(target).length,
+              writable: false
+            };
+          }
+          return Object.getOwnPropertyDescriptor(target, prop);
+        }
+      });
+    } catch {}
+
+    try {
+      if (proxyStorage) {
+        Object.defineProperty(window, storageName, {
+          configurable: true,
+          enumerable: true,
+          get: function () {
+            return proxyStorage;
+          }
+        });
+      }
+    } catch {}
+
+    syncBlockedKeyProperties(storage);
+    proto.__auraSupabaseFirewallPatched = true;
+  }
+
+  function patchCookieAccess() {
+    try {
+      var cookieDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "cookie");
+      if (!cookieDescriptor || !cookieDescriptor.configurable) return;
+
+      Object.defineProperty(document, "cookie", {
+        configurable: true,
+        enumerable: false,
+        get: function () {
+          return "";
+        },
+        set: function () {
+          return true;
+        }
+      });
+    } catch {}
+  }
+
+  function patchFetch() {
+    if (typeof window.fetch !== "function") return;
+    var rawFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      if (requestLooksSensitive(input, init, null)) {
+        return Promise.reject(new Error("Blocked by Aura security policy"));
+      }
+      return rawFetch(input, init);
+    };
+  }
+
+  function patchXHR() {
+    if (typeof XMLHttpRequest === "undefined") return;
+    var rawOpen = XMLHttpRequest.prototype.open;
+    var rawSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    var rawSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__auraRequestUrl = String(url || "");
+      this.__auraHeaders = {};
+      return rawOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (!this.__auraHeaders) this.__auraHeaders = {};
+      this.__auraHeaders[String(name || "").toLowerCase()] = String(value || "");
+      return rawSetHeader.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      if (requestLooksSensitive(this.__auraRequestUrl || "", null, this.__auraHeaders || null)) {
+        throw new Error("Blocked by Aura security policy");
+      }
+      return rawSend.apply(this, arguments);
+    };
+  }
+
+  function patchBeacon() {
+    if (typeof navigator.sendBeacon !== "function") return;
+    var rawBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      if (requestLooksSensitive(url, null, null)) return false;
+      return rawBeacon(url, data);
+    };
+  }
+
+  function patchWebSocket() {
+    if (typeof WebSocket === "undefined") return;
+    var RawWebSocket = WebSocket;
+    window.WebSocket = function (url, protocols) {
+      if (requestLooksSensitive(String(url || ""), null, null)) {
+        throw new Error("Blocked by Aura security policy");
+      }
+      return new RawWebSocket(url, protocols);
+    };
+    window.WebSocket.prototype = RawWebSocket.prototype;
+  }
+
+  patchStorage(window.localStorage, "localStorage");
+  patchStorage(window.sessionStorage, "sessionStorage");
+  patchCookieAccess();
+  patchFetch();
+  patchXHR();
+  patchBeacon();
+  patchWebSocket();
+})();</script>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Dream Experience — Conteúdo, Experiência &amp; Creative Data</title>
+<meta name="description" content="Nossas entregas podem ter os mais diversos formatos. Content, experience marketing, creative data e direção artística. Dream Factory."/>
+<!-- Favicon do símbolo Dream Factory. O PNG mantém os furos transparentes, então o
+     símbolo lê tanto em aba clara quanto escura; o ícone iOS vai achatado em preto
+     porque o iOS não respeita alpha em apple-touch-icon. -->
+<link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png"/>
+<link rel="icon" type="image/png" sizes="any" href="img/logo1.png"/>
+<link rel="apple-touch-icon" sizes="180x180" href="img/apple-touch-icon.png"/>
+<meta name="theme-color" content="#0095DA"/>
+<script src="assets/iconify-icon_e19829e7f0e8.js"></script>
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="assets/css2_adf3bf67eea9.css" rel="stylesheet"/>
+<link href="https://fonts.cdnfonts.com/css/gotham" rel="stylesheet"/>
+<script src="assets/resource_3fa48481346f.es"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.13.0/gsap.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.13.0/ScrollTrigger.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lenis@1.3.11/dist/lenis.min.js"></script>
+<style>
+/* ===== Dream Experience — style guide =====
+   Paleta extraída do logo oficial: azul #0095DA, laranja #F99D34, preto, branco.
+   Mecânica herdada do template: clip-paths rasgados, seções em skew,
+   halftone, sombras duras, tipografia "ransom note". */
+:root{
+  --df-blue:#0095DA;
+  --df-blue-dark:#0077AF;
+  --df-orange:#F99D34;
+  --df-black:#000000;
+  --df-ink:#0B0B0D;
+  --df-smoke:#15161A;
+  --df-white:#FFFFFF;
+}
+*{box-sizing:border-box}
+html{background:var(--df-black)}
+body{
+  font-family:'Gotham Light','Oswald',sans-serif;
+  background-color:var(--df-black);
+  overflow-x:hidden;
+  cursor:none;
+}
+@media (max-width:1024px){body{cursor:auto}}
+.font-black-df{font-family:'Gotham Black','Anton',sans-serif;letter-spacing:-.02em}
+.font-df{font-family:'Gotham','Oswald',sans-serif}
+.font-light-df{font-family:'Gotham Light','Oswald',sans-serif}
+/* mantidos do template, recoloridos */
+.font-marker{font-family:'Permanent Marker',cursive}
+.font-anton{font-family:'Gotham Black','Anton',sans-serif}
+
+.bg-halftone{
+  background-image:radial-gradient(#000 20%,transparent 20%),radial-gradient(#000 20%,transparent 20%);
+  background-color:var(--df-blue);
+  background-position:0 0,5px 5px;background-size:10px 10px;
+}
+.bg-halftone-white{
+  background-image:radial-gradient(#e5e5e5 20%,transparent 20%),radial-gradient(#e5e5e5 20%,transparent 20%);
+  background-color:#fff;background-position:0 0,5px 5px;background-size:10px 10px;
+}
+.bg-grid{
+  background-image:linear-gradient(rgba(0,149,218,.09) 1px,transparent 1px),linear-gradient(90deg,rgba(0,149,218,.09) 1px,transparent 1px);
+  background-size:72px 72px;
+}
+.clip-jagged{clip-path:polygon(0 0,100% 0,98% 100%,2% 98%)}
+.clip-slant-right{clip-path:polygon(0 0,100% 0,90% 100%,0% 100%)}
+.clip-slant-left{clip-path:polygon(10% 0,100% 0,100% 100%,0% 100%)}
+.clip-starburst{clip-path:polygon(20% 0%,80% 0%,100% 20%,100% 80%,80% 100%,20% 100%,0% 80%,0% 20%)}
+.text-shadow-hard{text-shadow:4px 4px 0 #000}
+.box-shadow-hard{box-shadow:10px 10px 0 #000}
+.box-shadow-blue{box-shadow:10px 10px 0 var(--df-blue)}
+.box-shadow-orange{box-shadow:10px 10px 0 var(--df-orange)}
+.stroke-text{-webkit-text-stroke:1.5px var(--df-white);color:transparent}
+
+/* Lenis */
+html.lenis,html.lenis body{height:auto}
+.lenis.lenis-smooth{scroll-behavior:auto!important}
+.lenis.lenis-stopped{overflow:hidden}
+
+/* split text */
+.line-mask{display:inline-block;overflow:hidden;vertical-align:bottom}
+.ch{display:inline-block;will-change:transform}
+
+/* cursor */
+#cursor{
+  position:fixed;top:0;left:0;width:16px;height:16px;border-radius:999px;
+  background:var(--df-orange);pointer-events:none;z-index:9999;mix-blend-mode:difference;
+  transform:translate3d(-50%,-50%,0);margin-left:-8px;margin-top:-8px;
+}
+#cursor-ring{
+  position:fixed;top:0;left:0;width:52px;height:52px;border:2px solid var(--df-blue);
+  border-radius:999px;pointer-events:none;z-index:9998;
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Gotham Black','Anton',sans-serif;font-size:10px;letter-spacing:.14em;color:var(--df-white);
+  margin-left:-26px;margin-top:-26px;
+}
+#cursor-ring span{opacity:0}
+@media (max-width:1024px){#cursor,#cursor-ring{display:none}}
+
+/* progress */
+#progress{position:fixed;top:0;left:0;height:4px;width:100%;transform-origin:0 50%;transform:scaleX(0);background:var(--df-orange);z-index:9997}
+
+/* preloader */
+#preloader{position:fixed;inset:0;z-index:9996;background:var(--df-black);display:flex;align-items:center;justify-content:center}
+
+/* marquee */
+.marquee{display:flex;width:max-content;will-change:transform}
+.marquee span{display:inline-flex;align-items:center;white-space:nowrap}
+
+/* media */
+.case-media{aspect-ratio:16/9;background:var(--df-smoke)}
+.case-media video{width:100%;height:100%;object-fit:cover;display:block}
+.noise:after{
+  content:"";position:absolute;inset:0;pointer-events:none;opacity:.3;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence baseFrequency='.9' numOctaves='3'/></filter><rect width='120' height='120' filter='url(%23n)' opacity='.5'/></svg>");
+}
+::-webkit-scrollbar{width:10px}
+::-webkit-scrollbar-track{background:var(--df-black)}
+::-webkit-scrollbar-thumb{background:var(--df-blue)}
+::selection{background:var(--df-blue);color:#fff}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.01ms!important;transition-duration:.01ms!important}
+}
+</style>
+</head>
+<body class="antialiased text-white bg-black">
+
+<div id="progress"></div>
+<div id="cursor"></div>
+<div id="cursor-ring"><span>VER</span></div>
+
+<!-- ============ PRELOADER ============ -->
+<div id="preloader">
+  <div class="text-center px-6">
+    <div class="flex items-center justify-center gap-4 mb-6" id="pre-logo">
+      <span class="block w-16 h-16 rounded-full bg-[#0095DA] relative">
+        <span class="absolute left-[14%] top-[10%] w-[44%] h-[44%] rounded-full bg-black"></span>
+        <span class="absolute left-[52%] top-[52%] w-[24%] h-[24%] rounded-full bg-black"></span>
+      </span>
+      <span class="font-black-df text-5xl md:text-7xl uppercase leading-none">dream<span class="text-[#F99D34]">x</span></span>
+    </div>
+    <div class="h-[3px] w-[62vw] max-w-xl bg-white/15 relative overflow-hidden mx-auto">
+      <div id="pre-bar" class="absolute inset-y-0 left-0 w-full bg-[#F99D34] origin-left scale-x-0"></div>
+    </div>
+    <p class="font-df text-xs tracking-[.4em] uppercase text-white/50 mt-4"><span id="pre-num">0</span>% — carregando a experiência</p>
+  </div>
+</div>
+
+<!-- ============ NAV ============ -->
+<nav class="fixed top-0 w-full z-[90] pointer-events-none">
+  <div class="container mx-auto px-4 py-4 flex justify-between items-start">
+    <!-- Logo Block -->
+    <a id="nav-logo" href="#home" data-scroll-to="#home" class="relative pointer-events-auto group" aria-label="Dream Experience">
+      <!-- md:w-[360px] casa com a faixa de badges do hero logo abaixo -->
+      <div class="bg-black text-white px-5 py-3 clip-jagged border-2 border-white relative z-10 flex items-center gap-3 md:w-[360px]">
+        <span class="block w-9 h-9 md:w-11 md:h-11 rounded-full bg-[#0095DA] relative shrink-0">
+          <span class="absolute left-[14%] top-[10%] w-[44%] h-[44%] rounded-full bg-black"></span>
+          <span class="absolute left-[52%] top-[52%] w-[24%] h-[24%] rounded-full bg-black"></span>
+        </span>
+        <h1 class="font-black-df text-3xl md:text-6xl tracking-tighter uppercase leading-none">
+          Dream<span class="text-[#F99D34]">X</span>
+        </h1>
+      </div>
+      <div class="absolute inset-0 bg-[#0095DA] clip-jagged transform translate-x-2 translate-y-2 group-hover:translate-x-3 group-hover:translate-y-3 transition-transform"></div>
+    </a>
+
+    <!-- Nav Links (Skewed) -->
+    <div id="nav-links" class="hidden md:flex items-center gap-2 pointer-events-auto">
+      <a href="#sobre" data-scroll-to="#sobre" class="bg-white text-black px-4 py-2 font-df font-bold uppercase text-sm transform -skew-x-12 hover:bg-[#0095DA] hover:text-white transition-colors"><span class="inline-block skew-x-12">Sobre</span></a>
+      <a href="#cases" data-scroll-to="#cases" class="bg-white text-black px-4 py-2 font-df font-bold uppercase text-sm transform -skew-x-12 hover:bg-[#0095DA] hover:text-white transition-colors"><span class="inline-block skew-x-12">Cases</span></a>
+      <a href="#contato" data-scroll-to="#contato" class="bg-[#F99D34] text-black px-4 py-2 font-df font-bold uppercase text-sm transform -skew-x-12 hover:bg-white transition-colors"><span class="inline-block skew-x-12">Contato</span></a>
+    </div>
+
+    <!-- Mobile Menu Icon -->
+    <button id="burger" class="md:hidden pointer-events-auto bg-[#0095DA] text-white w-11 h-11 flex items-center justify-center border-2 border-white clip-jagged" aria-label="Abrir menu">
+      <iconify-icon icon="solar:hamburger-menu-linear" width="26"></iconify-icon>
+    </button>
+  </div>
+</nav>
+
+<!-- Mobile drawer -->
+<div id="drawer" class="fixed inset-0 z-[95] bg-black/95 backdrop-blur-sm hidden flex-col items-center justify-center gap-5">
+  <button id="drawer-close" class="absolute top-6 right-6 text-white" aria-label="Fechar menu"><iconify-icon icon="solar:close-circle-linear" width="34"></iconify-icon></button>
+  <a href="#home" data-scroll-to="#home" class="drawer-link font-black-df text-5xl uppercase">Home</a>
+  <a href="#sobre" data-scroll-to="#sobre" class="drawer-link font-black-df text-5xl uppercase">Sobre</a>
+  <a href="#cases" data-scroll-to="#cases" class="drawer-link font-black-df text-5xl uppercase text-[#0095DA]">Cases</a>
+  <a href="#contato" data-scroll-to="#contato" class="drawer-link font-black-df text-5xl uppercase text-[#F99D34]">Contato</a>
+</div>
+
+<!-- ============ HERO ============ -->
+<section id="home" class="relative min-h-screen flex items-center overflow-hidden noise">
+  <div class="absolute inset-0 z-0 pointer-events-none">
+    <video id="hero-bg" class="absolute inset-0 w-full h-full object-cover"
+      src="video/hero-background.mp4" autoplay muted loop playsinline preload="auto"
+      aria-hidden="true"></video>
+  </div>
+  <div class="absolute inset-0 z-[1] bg-black/45"></div>
+  <div class="absolute inset-0 z-[1] bg-gradient-to-r from-black/95 via-black/40 to-transparent"></div>
+  <!-- Formas decorativas (mecânica do template) -->
+  <div class="absolute -left-24 top-1/4 w-72 h-72 bg-halftone opacity-25 clip-starburst z-[2] pointer-events-none" data-speed="0.25"></div>
+  <div class="absolute right-[-60px] bottom-[-40px] w-80 h-80 bg-[#F99D34]/20 clip-slant-left z-[2] pointer-events-none" data-speed="-0.2"></div>
+  <div class="absolute inset-0 z-[2] bg-grid opacity-40 pointer-events-none"></div>
+
+  <div class="container mx-auto px-4 relative z-10 pt-44 md:pt-52 pb-24">
+    <!-- fonte menor + md:w-[360px]: a faixa termina alinhada com a borda direita do logo -->
+    <div class="transform -rotate-1 flex flex-wrap items-center gap-1.5 md:gap-0 md:w-[360px] md:justify-between mb-6" data-fade>
+      <span class="bg-[#0095DA] text-white px-2 py-1 font-df font-bold uppercase text-[10px] md:text-[9px] tracking-[.1em]">Dream Factory</span>
+      <span class="bg-white text-black px-2 py-1 font-df font-bold uppercase text-[10px] md:text-[9px] tracking-[.1em]">Live Marketing</span>
+      <span class="bg-[#F99D34] text-black px-2 py-1 font-df font-bold uppercase text-[10px] md:text-[9px] tracking-[.1em]">Rio de Janeiro</span>
+    </div>
+
+    <h2 class="font-black-df uppercase leading-[0.82] text-white text-shadow-hard text-[12vw] md:text-[7.5vw]" data-split>
+      Dream<br/><span class="text-[#0095DA]">Experience</span>
+    </h2>
+
+    <p class="font-light-df text-lg md:text-2xl text-gray-100 bg-black/70 border-l-4 border-[#F99D34] p-5 mt-8 max-w-xl transform rotate-1" data-fade>
+      Nossas entregas podem ter os mais diversos <span class="font-marker text-[#F99D34] text-2xl md:text-3xl">formatos</span> — o que nos permite oferecer uma grande variedade de soluções.
+    </p>
+
+    <div class="flex flex-wrap items-center gap-6 mt-10" data-fade>
+      <a href="#cases" data-scroll-to="#cases" class="group relative inline-block">
+        <span class="relative z-10 block bg-[#0095DA] text-white font-black-df text-xl md:text-2xl uppercase px-8 py-4 clip-jagged border-2 border-white transform -skew-x-6 group-hover:-translate-y-1 transition-transform">Ver os cases</span>
+        <span class="absolute inset-0 bg-black clip-jagged transform translate-x-2 translate-y-2 -skew-x-6"></span>
+      </a>
+      <a href="#sobre" data-scroll-to="#sobre" class="inline-flex items-center gap-2 font-df font-bold uppercase tracking-widest text-sm text-white/80 hover:text-[#F99D34] transition-colors">
+        <iconify-icon icon="solar:play-circle-linear" width="26"></iconify-icon> Assistir ao filme
+      </a>
+    </div>
+  </div>
+
+  <div class="absolute bottom-6 left-0 w-full z-10 flex justify-center">
+    <div class="font-df text-[10px] tracking-[.5em] uppercase text-white/50 animate-bounce">scroll</div>
+  </div>
+</section>
+
+<!-- ============ MARQUEE ============ -->
+<div class="relative bg-[#0095DA] border-y-4 border-black py-4 -skew-y-2 overflow-hidden z-20">
+  <div class="marquee font-black-df text-3xl md:text-5xl uppercase text-black" id="marquee-1">
+    <span>Conteúdo <span class="text-white px-4">&amp;</span> Experiência <span class="text-white px-4">/</span> Comunicação Integrada <span class="text-white px-4">/</span> Creative Data <span class="text-white px-4">/</span> Valor Compartilhado <span class="text-white px-4">/</span> Estratégia B2B <span class="text-white px-4">/</span> Direção Artística <span class="text-white px-4">/</span></span>
+    <span>Conteúdo <span class="text-white px-4">&amp;</span> Experiência <span class="text-white px-4">/</span> Comunicação Integrada <span class="text-white px-4">/</span> Creative Data <span class="text-white px-4">/</span> Valor Compartilhado <span class="text-white px-4">/</span> Estratégia B2B <span class="text-white px-4">/</span> Direção Artística <span class="text-white px-4">/</span></span>
+  </div>
+</div>
+
+<!-- ============ SOBRE / FILME ============ -->
+<section id="sobre" class="relative py-28 md:py-40 overflow-hidden">
+  <div class="absolute inset-0 bg-grid opacity-30 pointer-events-none"></div>
+  <div class="absolute top-12 left-0 w-full overflow-hidden pointer-events-none select-none">
+    <h3 class="font-black-df text-[22vw] leading-none uppercase stroke-text opacity-[.07] whitespace-nowrap" data-speed="0.3">experience experience</h3>
+  </div>
+
+  <div class="container mx-auto px-4 relative z-10">
+    <!-- menor e mais largo: fecha em 2 linhas, liberando altura pro filme maior -->
+    <div class="max-w-5xl mb-9">
+      <h2 class="font-black-df text-4xl md:text-[3.25rem] uppercase leading-[0.88]" data-split>
+        O que nos permite oferecer uma grande variedade de <span class="text-[#0095DA]">soluções</span>
+      </h2>
+    </div>
+
+    <!-- Filme institucional. max-w em vh trava a altura em ~77vh, então as 4 quinas
+         do card cabem na tela. O scrub anima scale (transform), não width: largura
+         mudaria a altura via aspect-ratio e deslocaria o resto da página no meio do
+         scroll, quebrando o alvo dos links de menu. -->
+    <div id="film-wrap" class="relative mx-auto w-full max-w-[132vh] will-change-transform">
+      <!-- sem [data-media] de propósito: esse card tem o scrub de scale próprio -->
+      <div class="relative clip-jagged border-4 border-white box-shadow-blue overflow-hidden" style="aspect-ratio:16/9">
+        <video id="film" class="absolute inset-0 w-full h-full object-cover"
+          src="video/sobre-dream-experience.mp4" muted loop playsinline preload="auto"
+          title="Filme institucional Dream Experience"></video>
+        <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#F99D34] text-black w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+          <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+        </button>
+      </div>
+      <div class="absolute -top-6 -left-4 bg-[#F99D34] text-black font-black-df uppercase text-sm px-4 py-2 transform -rotate-3 border-2 border-black">o filme</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CASES — INTRO ============ -->
+<section id="cases" class="relative bg-white text-black py-24 md:py-32 -skew-y-2 origin-top-left border-y-8 border-black overflow-hidden">
+  <div class="skew-y-2 container mx-auto px-4 relative z-10">
+    <div class="absolute -right-10 -top-10 w-56 h-56 bg-halftone opacity-30 clip-starburst pointer-events-none"></div>
+    <h2 class="font-black-df text-5xl md:text-8xl uppercase leading-[0.85] max-w-[18ch]" data-split>
+      Nossas entregas podem ter os mais diversos
+      <span class="font-marker text-[#0095DA] text-5xl md:text-8xl">formatos</span>
+    </h2>
+    <div class="mt-10 flex flex-wrap gap-3 font-black-df uppercase text-lg md:text-2xl">
+      <span class="bg-black text-white px-3 py-1 transform rotate-2">6 cases</span>
+      <span class="bg-[#0095DA] text-white px-3 py-1 transform -rotate-2">4 marcas</span>
+      <span class="bg-[#F99D34] text-black px-3 py-1 transform rotate-1">1 método</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CASES ============ -->
+<div class="relative bg-black">
+
+  <!-- CASE 01 — DEXTER -->
+  <section class="relative py-24 md:py-36 overflow-hidden border-b border-white/10">
+    <div class="container mx-auto px-4">
+      <p class="font-light-df uppercase tracking-tight text-2xl md:text-5xl leading-[1.05] max-w-[22ch] text-white/90" data-split>
+        Pode ser uma ação especial para influenciadores que integra
+        <span class="font-marker text-[#0095DA] lowercase">conteúdo &amp; experiência</span>
+        de um modo único
+      </p>
+
+      <div class="grid md:grid-cols-12 gap-10 items-center mt-14">
+        <div class="md:col-span-7">
+          <div class="case-media relative clip-jagged border-4 border-white box-shadow-blue overflow-hidden transform -rotate-1" data-media>
+            <video preload="none" muted loop playsinline src="https://dreamexperience.dreamfactory.com.br/wp-content/uploads/2022/10/dexter_casestudy-2.mov"></video>
+            <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#F99D34] text-black w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+              <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+            </button>
+          </div>
+        </div>
+        <div class="md:col-span-5" data-fade>
+          <span class="inline-block bg-white text-black font-df font-bold uppercase text-xs tracking-widest px-3 py-1 transform -skew-x-12 mb-4">Case 01</span>
+          <h3 class="font-black-df text-4xl md:text-6xl uppercase leading-[0.9] text-shadow-hard">Lançamento<br/>Dexter:<br/><span class="text-[#0095DA]">New Blood</span></h3>
+          <p class="font-light-df text-base md:text-lg text-gray-300 mt-5 border-l-4 border-[#F99D34] pl-4">
+            Recriamos dois cenários icônicos da história do personagem e os transformamos em content studios para influenciadores gerarem buzz sobre o lançamento da série — que se tornou o conteúdo streaming mais visto no país durante aquela semana.
+          </p>
+          <div class="mt-6 flex items-center gap-4">
+            <span class="font-df uppercase text-xs tracking-[.3em] text-white/40">Cliente</span>
+            <img class="h-7 object-contain" loading="lazy" src="https://dreamfactory.blob.core.windows.net/dreamexperience/2022/10/Logo-Paramount.png" alt="Paramount"/>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CASE 02 — BRAHMA -->
+  <section class="relative py-24 md:py-36 overflow-hidden border-b border-white/10">
+    <div class="container mx-auto px-4">
+      <p class="font-light-df uppercase tracking-tight text-2xl md:text-5xl leading-[1.05] max-w-[24ch] md:ml-auto md:text-right text-white/90" data-split>
+        Podem ser campanhas de comunicação
+        <span class="font-marker text-[#F99D34] lowercase">integrada</span>
+        que envolvem digital, content e experimental marketing na mesma jogada
+      </p>
+
+      <div class="grid md:grid-cols-12 gap-10 items-center mt-14">
+        <div class="md:col-span-5 md:order-2" data-fade>
+          <span class="inline-block bg-[#F99D34] text-black font-df font-bold uppercase text-xs tracking-widest px-3 py-1 transform -skew-x-12 mb-4">Case 02</span>
+          <h3 class="font-black-df text-4xl md:text-6xl uppercase leading-[0.9] text-shadow-hard">Carnaval<br/>de Rua<br/><span class="text-[#F99D34]">Brahma</span></h3>
+          <p class="font-light-df text-base md:text-lg text-gray-300 mt-5 border-l-4 border-[#0095DA] pl-4">
+            Lançamos o movimento “O maior sextou do ano” e imortalizamos Zeca Pagodinho em uma estátua. A ação teve geração de conteúdo em real time e consolidou a Brahma como a nova marca do Carnaval de Rua do Rio.
+          </p>
+          <div class="mt-6 flex items-center gap-4">
+            <span class="font-df uppercase text-xs tracking-[.3em] text-white/40">Cliente</span>
+            <img class="h-7 object-contain" loading="lazy" src="https://dreamfactory.blob.core.windows.net/dreamexperience/2022/10/Logo_ambev.png" alt="Ambev"/>
+          </div>
+        </div>
+        <div class="md:col-span-7 md:order-1">
+          <div class="case-media relative clip-jagged border-4 border-white box-shadow-orange overflow-hidden transform rotate-1" data-media>
+            <video preload="none" muted loop playsinline src="https://dreamexperience.dreamfactory.com.br/wp-content/uploads/2022/10/carnaval-de-rua.mp4"></video>
+            <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#0095DA] text-white w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+              <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CASE 03 — STELLA -->
+  <section class="relative py-24 md:py-36 overflow-hidden border-b border-white/10">
+    <div class="container mx-auto px-4">
+      <p class="font-light-df uppercase tracking-tight text-2xl md:text-5xl leading-[1.05] max-w-[22ch] text-white/90" data-split>
+        Também pode ser uma solução totalmente ancorada em
+        <span class="font-marker text-[#0095DA] lowercase">creative data</span>
+      </p>
+
+      <div class="grid md:grid-cols-12 gap-10 items-center mt-14">
+        <div class="md:col-span-7">
+          <div class="case-media relative clip-jagged border-4 border-white box-shadow-blue overflow-hidden transform -rotate-1" data-media>
+            <video preload="none" muted loop playsinline src="https://dreamexperience.dreamfactory.com.br/wp-content/uploads/2022/10/Christmas-Market-Stella-Artois.mp4"></video>
+            <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#F99D34] text-black w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+              <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+            </button>
+          </div>
+        </div>
+        <div class="md:col-span-5" data-fade>
+          <span class="inline-block bg-white text-black font-df font-bold uppercase text-xs tracking-widest px-3 py-1 transform -skew-x-12 mb-4">Case 03</span>
+          <h3 class="font-black-df text-4xl md:text-6xl uppercase leading-[0.9] text-shadow-hard">Christmas<br/>Market<br/><span class="text-[#0095DA]">Stella Artois</span></h3>
+          <p class="font-light-df text-base md:text-lg text-gray-300 mt-5 border-l-4 border-[#F99D34] pl-4">
+            Nosso BI captou nas redes um fenômeno: “a tensão pré-fim-de-ano”. Aquela ansiedade pelo curto espaço de tempo para comprar os presentes de Natal, marcar a cerveja com os amigos, fazer doações… Para amenizar a pressão, criamos um lugar onde tudo isso podia ser resolvido de uma só vez.
+          </p>
+          <div class="mt-6 flex items-center gap-4">
+            <span class="font-df uppercase text-xs tracking-[.3em] text-white/40">Cliente</span>
+            <img class="h-7 object-contain" loading="lazy" src="https://dreamfactory.blob.core.windows.net/dreamexperience/2022/10/Logo_ambev.png" alt="Ambev"/>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CASE 04 — MAGALU -->
+  <section class="relative py-24 md:py-36 overflow-hidden border-b border-white/10">
+    <div class="container mx-auto px-4">
+      <p class="font-light-df uppercase tracking-tight text-2xl md:text-5xl leading-[1.05] max-w-[24ch] md:ml-auto md:text-right text-white/90" data-split>
+        Ou uma das maiores ações de marketing de
+        <span class="font-marker text-[#F99D34] lowercase">valor compartilhado</span>
+        que o Rio de Janeiro já recebeu
+      </p>
+
+      <div class="grid md:grid-cols-12 gap-10 items-center mt-14">
+        <div class="md:col-span-5 md:order-2" data-fade>
+          <span class="inline-block bg-[#F99D34] text-black font-df font-bold uppercase text-xs tracking-widest px-3 py-1 transform -skew-x-12 mb-4">Case 04</span>
+          <h3 class="font-black-df text-4xl md:text-6xl uppercase leading-[0.9] text-shadow-hard">Lançamento<br/><span class="text-[#F99D34]">Magalu</span><br/>Rio de Janeiro</h3>
+          <p class="font-light-df text-base md:text-lg text-gray-300 mt-5 border-l-4 border-[#0095DA] pl-4">
+            Reforma de BRTs, renovação dos guarda-sóis da orla e um show de luzes e laser no Cristo Redentor para celebrar. Foi através do marketing de valor compartilhado que fizemos os cariocas se apaixonarem por Magalu.
+          </p>
+          <div class="mt-6 flex items-center gap-4">
+            <span class="font-df uppercase text-xs tracking-[.3em] text-white/40">Cliente</span>
+            <img class="h-7 object-contain" loading="lazy" src="https://dreamfactory.blob.core.windows.net/dreamexperience/2022/10/Logo-MAGALU.png" alt="Magalu"/>
+          </div>
+        </div>
+        <div class="md:col-span-7 md:order-1">
+          <div class="case-media relative clip-jagged border-4 border-white box-shadow-orange overflow-hidden transform rotate-1" data-media>
+            <video preload="none" muted loop playsinline src="https://dreamexperience.dreamfactory.com.br/wp-content/uploads/2022/10/Magalu.mp4"></video>
+            <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#0095DA] text-white w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+              <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CASE 05 — VISA -->
+  <section class="relative py-24 md:py-36 overflow-hidden border-b border-white/10">
+    <div class="container mx-auto px-4">
+      <p class="font-light-df uppercase tracking-tight text-2xl md:text-5xl leading-[1.05] max-w-[22ch] text-white/90" data-split>
+        Pode ser algo bem específico, como potencializar a sua
+        <span class="font-marker text-[#0095DA] lowercase">estratégia B2B</span>
+        de relacionamento
+      </p>
+
+      <div class="grid md:grid-cols-12 gap-10 items-center mt-14">
+        <div class="md:col-span-7">
+          <!-- ponytail: o .mp4 original está 404 na origem; este veio do YouTube
+               e agora é servido local, como os demais cases. -->
+          <div class="case-media relative clip-jagged border-4 border-white box-shadow-blue overflow-hidden transform -rotate-1" data-media>
+            <video preload="none" muted loop playsinline src="video/case-visa.mp4"></video>
+            <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#F99D34] text-black w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+              <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+            </button>
+          </div>
+        </div>
+        <div class="md:col-span-5" data-fade>
+          <span class="inline-block bg-white text-black font-df font-bold uppercase text-xs tracking-widest px-3 py-1 transform -skew-x-12 mb-4">Case 05</span>
+          <h3 class="font-black-df text-4xl md:text-5xl uppercase leading-[0.9] text-shadow-hard">Relacionamento<br/>B2B<br/><span class="text-[#0095DA]">Visa</span></h3>
+          <p class="font-light-df text-base md:text-lg text-gray-300 mt-5 border-l-4 border-[#F99D34] pl-4">
+            Tangibilizamos as estratégias de relacionamento com bancos parceiros através de atuação calcada em três pilares: estratégia, experience e design. Promoções, campanhas de incentivo, eventos, ativações e apresentações institucionais estão entre as principais entregas realizadas.
+          </p>
+          <div class="mt-6 flex items-center gap-4">
+            <span class="font-df uppercase text-xs tracking-[.3em] text-white/40">Cliente</span>
+            <img class="h-7 object-contain" loading="lazy" src="https://dreamfactory.blob.core.windows.net/dreamexperience/2022/10/LOGO-VISA.png" alt="Visa"/>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CASE 06 — HALO -->
+  <section class="relative py-24 md:py-36 overflow-hidden">
+    <div class="container mx-auto px-4">
+      <p class="font-light-df uppercase tracking-tight text-2xl md:text-5xl leading-[1.05] max-w-[24ch] md:ml-auto md:text-right text-white/90" data-split>
+        Ou dar vida a projetos já idealizados que precisam de
+        <span class="font-marker text-[#F99D34] lowercase">direção artística &amp; execução</span>
+      </p>
+
+      <div class="grid md:grid-cols-12 gap-10 items-center mt-14">
+        <div class="md:col-span-5 md:order-2" data-fade>
+          <span class="inline-block bg-[#F99D34] text-black font-df font-bold uppercase text-xs tracking-widest px-3 py-1 transform -skew-x-12 mb-4">Case 06</span>
+          <h3 class="font-black-df text-4xl md:text-6xl uppercase leading-[0.9] text-shadow-hard">Screening Show<br/><span class="text-[#F99D34]">Halo</span><br/>Live-Action Series</h3>
+          <p class="font-light-df text-base md:text-lg text-gray-300 mt-5 border-l-4 border-[#0095DA] pl-4">
+            Show com 100 drones, coral de 40 vozes e 3D mapping numa réplica gigante do capacete do Master Chief. Tudo sincronizado em uma apresentação épica, seguida da exibição exclusiva do primeiro episódio.
+          </p>
+          <div class="mt-6 flex items-center gap-4">
+            <span class="font-df uppercase text-xs tracking-[.3em] text-white/40">Cliente</span>
+            <img class="h-7 object-contain" loading="lazy" src="https://dreamfactory.blob.core.windows.net/dreamexperience/2022/10/Logo-Paramount.png" alt="Paramount"/>
+          </div>
+        </div>
+        <div class="md:col-span-7 md:order-1">
+          <div class="case-media relative clip-jagged border-4 border-white box-shadow-orange overflow-hidden transform rotate-1" data-media>
+            <video preload="none" muted loop playsinline src="https://dreamexperience.dreamfactory.com.br/wp-content/uploads/2022/10/VIDEOCASE_HALO_v5-whatsapp.mp4"></video>
+            <button class="sound-btn absolute bottom-4 right-4 z-10 bg-[#0095DA] text-white w-11 h-11 flex items-center justify-center border-2 border-black" aria-label="Ligar ou desligar o som">
+              <iconify-icon icon="solar:volume-cross-linear" width="22"></iconify-icon>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ============ CONTATO ============ -->
+<section id="contato" class="relative bg-black py-24 md:py-36 overflow-hidden">
+  <div class="absolute inset-0 bg-grid opacity-30 pointer-events-none"></div>
+  <div class="absolute -left-20 bottom-0 w-80 h-80 bg-halftone opacity-20 clip-starburst pointer-events-none" data-speed="0.2"></div>
+
+  <div class="container mx-auto px-4 relative z-10 grid md:grid-cols-12 gap-14">
+    <div class="md:col-span-5">
+      <h2 class="font-black-df text-6xl md:text-8xl uppercase leading-[0.85] text-shadow-hard" data-split>
+        con<br/><span class="text-[#0095DA]">tato</span>
+      </h2>
+      <div class="mt-10 bg-white text-black p-6 clip-jagged border-4 border-[#0095DA] transform -rotate-1 max-w-sm">
+        <h4 class="font-black-df text-xl uppercase mb-2">Marina da Glória</h4>
+        <p class="font-light-df text-sm leading-relaxed">
+          Avenida Infante Dom Henrique s/n.<br/>
+          Marina da Glória — Rio de Janeiro<br/>
+          CEP 20021-140
+        </p>
+      </div>
+      <div class="flex gap-3 mt-8">
+        <a class="w-11 h-11 bg-white text-black flex items-center justify-center border-2 border-transparent hover:bg-[#0095DA] hover:text-white hover:border-white transition-colors transform hover:-rotate-12" href="#" aria-label="Instagram"><iconify-icon icon="solar:gallery-linear" width="20"></iconify-icon></a>
+        <a class="w-11 h-11 bg-white text-black flex items-center justify-center border-2 border-transparent hover:bg-[#F99D34] hover:border-white transition-colors transform hover:rotate-12" href="#" aria-label="LinkedIn"><iconify-icon icon="solar:case-linear" width="20"></iconify-icon></a>
+        <a class="w-11 h-11 bg-white text-black flex items-center justify-center border-2 border-transparent hover:bg-[#0095DA] hover:text-white hover:border-white transition-colors transform hover:-rotate-12" href="#" aria-label="YouTube"><iconify-icon icon="solar:play-circle-linear" width="20"></iconify-icon></a>
+      </div>
+    </div>
+
+    <div class="md:col-span-7">
+      <div class="flex flex-wrap gap-1 items-center font-black-df text-2xl md:text-3xl uppercase mb-6">
+        <span class="bg-white text-black px-2 transform rotate-2">Vamos</span>
+        <span class="bg-[#0095DA] text-white px-2 transform -rotate-3">criar</span>
+        <span class="bg-[#F99D34] text-black px-2 transform rotate-1">a próxima</span>
+        <span class="bg-white text-black px-2 transform -rotate-2">experiência</span>
+      </div>
+
+      <form id="contato-form" class="space-y-6" novalidate>
+        <div>
+          <label class="font-df uppercase text-xs tracking-[.3em] text-white/50" for="nome">Nome</label>
+          <input id="nome" name="nome" type="text" required class="w-full bg-transparent border-b-2 border-white/40 focus:border-[#0095DA] text-white font-light-df text-xl py-3 outline-none transition-colors"/>
+        </div>
+        <div>
+          <label class="font-df uppercase text-xs tracking-[.3em] text-white/50" for="email">Email</label>
+          <input id="email" name="email" type="email" required class="w-full bg-transparent border-b-2 border-white/40 focus:border-[#0095DA] text-white font-light-df text-xl py-3 outline-none transition-colors"/>
+        </div>
+        <div>
+          <label class="font-df uppercase text-xs tracking-[.3em] text-white/50" for="mensagem">Mensagem</label>
+          <textarea id="mensagem" name="mensagem" rows="4" required class="w-full bg-transparent border-b-2 border-white/40 focus:border-[#0095DA] text-white font-light-df text-xl py-3 outline-none transition-colors resize-none"></textarea>
+        </div>
+        <p id="form-msg" class="font-df uppercase text-xs tracking-widest hidden" role="status"></p>
+        <button type="submit" class="group relative inline-block">
+          <span class="relative z-10 block bg-[#F99D34] text-black font-black-df text-xl uppercase px-10 py-4 clip-jagged border-2 border-black transform -skew-x-6 group-hover:-translate-y-1 transition-transform">Enviar</span>
+          <span class="absolute inset-0 bg-[#0095DA] clip-jagged transform translate-x-2 translate-y-2 -skew-x-6"></span>
+        </button>
+      </form>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer class="bg-black text-white relative pt-16 pb-8 border-t-8 border-[#0095DA]">
+  <div class="absolute top-[-20px] left-0 w-full h-8 bg-[#0095DA] clip-jagged transform rotate-180 z-20"></div>
+  <div class="container mx-auto px-4 relative z-10">
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-end gap-10">
+      <div class="transform -rotate-1">
+        <div class="flex items-center gap-4">
+          <span class="block w-12 h-12 rounded-full bg-[#0095DA] relative shrink-0">
+            <span class="absolute left-[14%] top-[10%] w-[44%] h-[44%] rounded-full bg-black"></span>
+            <span class="absolute left-[52%] top-[52%] w-[24%] h-[24%] rounded-full bg-black"></span>
+          </span>
+          <h2 class="font-black-df text-5xl uppercase select-none">Dream<span class="text-[#F99D34]">X</span></h2>
+        </div>
+        <p class="font-marker text-gray-400 text-lg mt-2">conteúdo &amp; experiência de um modo único.</p>
+      </div>
+      <div class="font-df uppercase text-xs tracking-[.3em] text-white/40 md:text-right leading-loose">
+        Dream Factory Comunicação e Eventos<br/>
+        Marina da Glória — Rio de Janeiro
+      </div>
+    </div>
+    <div class="mt-12 border-t border-white/10 pt-8 font-df text-xs text-gray-500 uppercase tracking-widest">
+      © <span id="year"></span> Dream Experience. Todos os direitos reservados.
+    </div>
+  </div>
+  <div class="absolute bottom-0 right-0 w-32 h-32 bg-halftone opacity-20 clip-slant-left pointer-events-none"></div>
+</footer>
+
+<script>
+(function () {
+  /* ---------- Sempre abre na hero ----------
+     Num refresh o browser restaura a posição de scroll e a página reabriria no meio
+     de um case, com o preloader por cima. Um hash na URL causaria o mesmo pulo.
+     Os links internos usam preventDefault + lenis.scrollTo, então nunca escrevem
+     hash — limpar aqui não quebra navegação.
+     Vem antes de registerPlugin de propósito: o ScrollTrigger guarda o
+     scrollRestoration no registro e o repõe depois, desfazendo este ajuste.
+     A trava final é o lenis.scrollTo(0) no fim do preloader. */
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+  window.scrollTo(0, 0);
+
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  gsap.registerPlugin(ScrollTrigger);
+
+  /* ---------- Lenis ---------- */
+  var lenis = new Lenis({ duration: 1.15, smoothWheel: true, lerp: 0.09 });
+  lenis.on('scroll', ScrollTrigger.update);
+  gsap.ticker.add(function (t) { lenis.raf(t * 1000); });
+  gsap.ticker.lagSmoothing(0);
+
+  var drawer = document.getElementById('drawer');
+  function closeDrawer() {
+    drawer.classList.add('hidden');
+    drawer.classList.remove('flex');
+    lenis.start();
+  }
+
+  document.querySelectorAll('[data-scroll-to]').forEach(function (a) {
+    a.addEventListener('click', function (e) {
+      e.preventDefault();
+      var target = a.getAttribute('data-scroll-to');
+      closeDrawer();
+      lenis.scrollTo(target, { offset: -10, duration: 1.4 });
+    });
+  });
+
+  /* ---------- Cursor ---------- */
+  var cur = document.getElementById('cursor');
+  var ring = document.getElementById('cursor-ring');
+  if (!reduce && window.matchMedia('(pointer:fine)').matches) {
+    var qx = gsap.quickTo(cur, 'x', { duration: 0.12, ease: 'power3' });
+    var qy = gsap.quickTo(cur, 'y', { duration: 0.12, ease: 'power3' });
+    var rx = gsap.quickTo(ring, 'x', { duration: 0.5, ease: 'power3' });
+    var ry = gsap.quickTo(ring, 'y', { duration: 0.5, ease: 'power3' });
+    window.addEventListener('mousemove', function (e) {
+      qx(e.clientX); qy(e.clientY); rx(e.clientX); ry(e.clientY);
+    });
+    document.querySelectorAll('a, button, [data-media]').forEach(function (el) {
+      el.addEventListener('mouseenter', function () {
+        gsap.to(ring, { scale: 1.9, borderColor: '#F99D34', duration: 0.3 });
+      });
+      el.addEventListener('mouseleave', function () {
+        gsap.to(ring, { scale: 1, borderColor: '#0095DA', duration: 0.3 });
+      });
+    });
+    document.querySelectorAll('[data-media]').forEach(function (el) {
+      el.addEventListener('mouseenter', function () { gsap.to(ring.firstElementChild, { opacity: 1, duration: 0.2 }); });
+      el.addEventListener('mouseleave', function () { gsap.to(ring.firstElementChild, { opacity: 0, duration: 0.2 }); });
+    });
+  }
+
+  /* ---------- Split por palavra ----------
+     ponytail: splitter mínimo. SplitText é plugin pago e char-level
+     custa layout demais em headlines de 8vw. Palavra basta. */
+  function splitWords(el) {
+    (function walk(node) {
+      Array.prototype.slice.call(node.childNodes).forEach(function (n) {
+        if (n.nodeType === 3) {
+          if (!n.textContent.trim()) return;
+          var frag = document.createDocumentFragment();
+          n.textContent.split(/(\s+)/).forEach(function (w) {
+            if (!w.trim()) { frag.appendChild(document.createTextNode(w)); return; }
+            var outer = document.createElement('span');
+            outer.className = 'line-mask';
+            var inner = document.createElement('span');
+            inner.className = 'ch';
+            inner.textContent = w;
+            outer.appendChild(inner);
+            frag.appendChild(outer);
+          });
+          node.replaceChild(frag, n);
+        } else if (n.nodeType === 1 && n.tagName !== 'BR' && !n.classList.contains('line-mask')) {
+          walk(n);
+        }
+      });
+    })(el);
+    return el.querySelectorAll('.ch');
+  }
+
+  /* ---------- Reveals ---------- */
+  document.querySelectorAll('[data-split]').forEach(function (el) {
+    var chars = splitWords(el);
+    if (!chars.length) return;
+    gsap.from(chars, {
+      yPercent: 115, rotate: 4, opacity: 0,
+      duration: 0.9, ease: 'expo.out', stagger: 0.022,
+      scrollTrigger: { trigger: el, start: 'top 88%' }
+    });
+  });
+
+  gsap.utils.toArray('[data-fade]').forEach(function (el) {
+    gsap.from(el, {
+      y: 44, opacity: 0, duration: 1, ease: 'power3.out',
+      scrollTrigger: { trigger: el, start: 'top 90%' }
+    });
+  });
+
+  /* Players dos cases entram como os textos: sobem por trás de uma máscara.
+     O #film-wrap do "sobre" não tem [data-media], então segue com o scrub próprio.
+     A máscara vai no elemento-pai em vez de um wrapper novo — mover um iframe no
+     DOM faz o YouTube recarregar. O padding com margem negativa abre espaço pra
+     sombra dura sem o overflow comê-la e sem mexer no layout. */
+  gsap.utils.toArray('[data-media]').forEach(function (el) {
+    var mask = el.parentElement;
+    mask.style.overflow = 'hidden';
+    mask.style.padding = '0 14px 14px 0';
+    mask.style.margin = '0 -14px -14px 0';
+    var tilt = gsap.getProperty(el, 'rotation') || 0;
+    gsap.fromTo(el,
+      { yPercent: 112, rotate: tilt + 4, opacity: 0 },
+      {
+        yPercent: 0, rotate: tilt, opacity: 1,
+        duration: 1, ease: 'expo.out',
+        scrollTrigger: { trigger: mask, start: 'top 88%' }
+      });
+  });
+
+  gsap.utils.toArray('[data-speed]').forEach(function (el) {
+    gsap.to(el, {
+      yPercent: parseFloat(el.dataset.speed) * -40,
+      ease: 'none',
+      scrollTrigger: { trigger: el, start: 'top bottom', end: 'bottom top', scrub: true }
+    });
+  });
+
+  /* ---------- Marquee ---------- */
+  var mq = document.getElementById('marquee-1');
+  if (mq) {
+    var mqTween = gsap.to(mq, { xPercent: -50, duration: 26, ease: 'none', repeat: -1 });
+    ScrollTrigger.create({
+      onUpdate: function (self) {
+        var v = gsap.utils.clamp(0, 3, Math.abs(self.getVelocity()) / 900);
+        gsap.to(mqTween, { timeScale: 1 + v, duration: 0.4, overwrite: true });
+      }
+    });
+  }
+
+  /* ---------- Filme: cresce até o tamanho máximo do slot ---------- */
+  var film = document.getElementById('film-wrap');
+  if (film && !reduce) {
+    gsap.fromTo(film, { scale: 0.74 }, {
+      scale: 1, ease: 'none',
+      scrollTrigger: { trigger: film, start: 'top 85%', end: 'top 30%', scrub: 0.6 }
+    });
+  }
+
+  /* ---------- Nav sai de cena ao passar da altura do header ----------
+     Um único ponto de corte: descendo esconde (logo p/ esquerda, menu p/ direita),
+     subindo no MESMO ponto volta. onEnter/onLeaveBack do ScrollTrigger já são
+     simétricos, então não há estado de direção pra manter. */
+  var navEl = document.querySelector('nav');
+  var navLogo = document.getElementById('nav-logo');
+  var navRight = [document.getElementById('nav-links'), document.getElementById('burger')].filter(Boolean);
+  if (navEl && navLogo && !reduce) {
+    ScrollTrigger.create({
+      start: function () { return navEl.offsetHeight; },
+      end: 'max',
+      invalidateOnRefresh: true,
+      onEnter: function () {
+        gsap.to(navLogo, { xPercent: -150, autoAlpha: 0, duration: 0.55, ease: 'power3.in', overwrite: true });
+        gsap.to(navRight, { xPercent: 150, autoAlpha: 0, duration: 0.55, ease: 'power3.in', overwrite: true });
+      },
+      onLeaveBack: function () {
+        gsap.to([navLogo].concat(navRight), { xPercent: 0, autoAlpha: 1, duration: 0.55, ease: 'power3.out', overwrite: true });
+      }
+    });
+  }
+
+  /* ---------- Vídeos: tocam só quando visíveis ----------
+     Vale pro hero também: o Chrome pausa vídeo fora da viewport por conta própria,
+     então sem este trigger ele não voltaria a tocar ao subir de volta. */
+  document.querySelectorAll('video').forEach(function (v) {
+    ScrollTrigger.create({
+      trigger: v, start: 'top 95%', end: 'bottom 5%',
+      onEnter: function () { v.preload = 'auto'; v.play().catch(function () {}); },
+      onEnterBack: function () { v.play().catch(function () {}); },
+      onLeave: function () { v.pause(); },
+      onLeaveBack: function () { v.pause(); }
+    });
+  });
+
+  document.querySelectorAll('.sound-btn').forEach(function (btn) {
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      var v = btn.parentElement.querySelector('video');
+      if (!v) return;
+      var ligando = v.muted;
+      if (ligando) {
+        // só um com som por vez
+        document.querySelectorAll('video').forEach(function (o) { if (o !== v) o.muted = true; });
+        document.querySelectorAll('.sound-btn iconify-icon').forEach(function (i) {
+          i.setAttribute('icon', 'solar:volume-cross-linear');
+        });
+      }
+      v.muted = !ligando;
+      btn.querySelector('iconify-icon').setAttribute('icon',
+        v.muted ? 'solar:volume-cross-linear' : 'solar:volume-loud-linear');
+      v.play().catch(function () {});
+    });
+  });
+
+  /* ---------- Barra de progresso ---------- */
+  gsap.to('#progress', { scaleX: 1, ease: 'none', scrollTrigger: { scrub: 0.3, start: 0, end: 'max' } });
+
+  /* ---------- Drawer mobile ---------- */
+  document.getElementById('burger').addEventListener('click', function () {
+    drawer.classList.remove('hidden');
+    drawer.classList.add('flex');
+    lenis.stop();
+    gsap.from('.drawer-link', { y: 40, opacity: 0, stagger: 0.07, duration: 0.5, ease: 'power3.out' });
+  });
+  document.getElementById('drawer-close').addEventListener('click', closeDrawer);
+
+  /* ---------- Form ---------- */
+  document.getElementById('contato-form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var f = e.currentTarget;
+    var msg = document.getElementById('form-msg');
+    msg.classList.remove('hidden');
+    if (!f.checkValidity()) {
+      msg.textContent = 'Preencha nome, email e mensagem.';
+      msg.style.color = '#F99D34';
+      gsap.fromTo(f, { x: -8 }, { x: 0, duration: 0.5, ease: 'elastic.out(1,0.3)' });
+      return;
+    }
+    // ponytail: sem backend. Troque por fetch() no seu endpoint quando existir.
+    msg.textContent = 'Mensagem validada. Conecte o endpoint em #contato-form para enviar de verdade.';
+    msg.style.color = '#0095DA';
+  });
+
+  document.getElementById('year').textContent = new Date().getFullYear();
+
+  /* ---------- Preloader ---------- */
+  var pre = document.getElementById('preloader');
+  var num = { v: 0 };
+  lenis.stop();
+  gsap.timeline({
+    onComplete: function () {
+      pre.style.display = 'none';
+      // trava no topo antes de devolver o scroll: o refresh do ScrollTrigger
+      // recalcula tudo a partir daqui
+      lenis.scrollTo(0, { immediate: true, force: true });
+      lenis.start();
+      ScrollTrigger.refresh();
+    }
+  })
+    .to('#pre-bar', { scaleX: 1, duration: 1.5, ease: 'power2.inOut' }, 0)
+    .to(num, {
+      v: 100, duration: 1.5, ease: 'power2.inOut',
+      onUpdate: function () { document.getElementById('pre-num').textContent = Math.round(num.v); }
+    }, 0)
+    .from('#pre-logo', { scale: 0.85, opacity: 0, duration: 0.8, ease: 'expo.out' }, 0)
+    .to('#preloader', { yPercent: -100, duration: 0.9, ease: 'expo.inOut' }, '+=0.15');
+
+  window.addEventListener('load', function () { ScrollTrigger.refresh(); });
+})();
+</script>
+</body></html>
